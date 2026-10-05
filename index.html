@@ -1,0 +1,329 @@
+<!doctype html>
+<!--
+  Fulcrum Tower status page — source: infra/status/page/index.html in the code repository; published as
+  the only page of the public status repository by infra/status/github-setup.sh (runbook docs/ops/TOWER-STATUS.md).
+
+  It is one static file. It reads status.json, which a timer on the Tower replaces once a minute on the
+  `status` branch of the repository this page is served from, and shows one of four states:
+    OPERATIONAL             the heartbeat is recent and every component is up
+    DEGRADED                the heartbeat is recent and at least one component is down
+    OFFLINE / WINDOWS MODE  no heartbeat for longer than the threshold (5 beats, 300 s at least)
+    STATUS UNKNOWN          the page could not establish either of the above (GitHub unreachable from the
+                            viewer, only a lagging copy available, or a timestamp from the future)
+  Two readers, newest heartbeat wins:
+    GitHub REST API   at most 60 s behind; 60 requests an hour per viewer address without a login
+    GitHub raw CDN    no request limit; up to 300 s behind, and a query string does not bypass its cache
+  OFFLINE is shown only when the API confirmed within the last 180 s that nothing newer exists, or when
+  the heartbeat is older than the threshold plus the CDN's 300 s. Nothing from status.json reaches the
+  DOM except through textContent, after validate() has reduced it to ids, up/down and a timestamp.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' https://api.github.com https://raw.githubusercontent.com; img-src data:; base-uri 'none'; form-action 'none'">
+<title>Tower status</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --line: #d0d7de;
+    --ok-bg: #e6f4ea; --ok-fg: #0b5a27; --warn-bg: #fff4d6; --warn-fg: #7a4d00;
+    --off-bg: #fde8e8; --off-fg: #8f1d1d; --unk-bg: #eef1f4; --unk-fg: #3d4650;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1419; --fg: #e6e9ed; --muted: #9aa4af; --line: #2c343d;
+      --ok-bg: #0f2e1b; --ok-fg: #7ee2a0; --warn-bg: #33270a; --warn-fg: #f2c661;
+      --off-bg: #3a1414; --off-fg: #ff9c9c; --unk-bg: #1c232b; --unk-fg: #c3ccd6;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 42rem; margin: 0 auto; padding: 2rem 1rem 3rem; }
+  h1 { font-size: 1rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin: 0 0 1rem; }
+  h2 { font-size: 1rem; margin: 1.75rem 0 .5rem; }
+  #banner { border-radius: .5rem; padding: 1.25rem 1.25rem 1.1rem; border: 1px solid var(--line); }
+  #state { font-size: 2rem; font-weight: 700; line-height: 1.15; letter-spacing: .01em; }
+  #summary { margin-top: .5rem; }
+  .state-operational { background: var(--ok-bg); color: var(--ok-fg); }
+  .state-degraded { background: var(--warn-bg); color: var(--warn-fg); }
+  .state-offline { background: var(--off-bg); color: var(--off-fg); }
+  .state-unknown { background: var(--unk-bg); color: var(--unk-fg); }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem; margin: 1.25rem 0 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  ul { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+  li { display: flex; justify-content: space-between; gap: 1rem; padding: .5rem 0; border-bottom: 1px solid var(--line); }
+  .pill { font-weight: 700; font-size: .85rem; letter-spacing: .05em; padding: .1rem .55rem; border-radius: 999px; }
+  .pill.up { background: var(--ok-bg); color: var(--ok-fg); }
+  .pill.down { background: var(--off-bg); color: var(--off-fg); }
+  .controls { margin-top: 1.5rem; color: var(--muted); }
+  button { font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: .4rem; padding: .35rem .8rem; cursor: pointer; }
+  details { margin-top: 1.5rem; color: var(--muted); }
+  details p { margin: .6rem 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Fulcrum Tower status</h1>
+
+  <section id="banner" class="state-unknown" role="status" aria-live="polite">
+    <div id="state">CHECKING</div>
+    <div id="summary">Reading the last heartbeat.</div>
+  </section>
+
+  <dl>
+    <dt id="hb-time-label">Last heartbeat</dt><dd id="hb-time">—</dd>
+    <dt>Age</dt><dd id="hb-age">—</dd>
+    <dt>Read from</dt><dd id="hb-source">—</dd>
+  </dl>
+
+  <section id="components-box" hidden>
+    <h2>Components</h2>
+    <ul id="components"></ul>
+  </section>
+
+  <p class="controls"><button id="refresh" type="button">Check now</button> <span id="checked"></span></p>
+
+  <details>
+    <summary>How to read this page</summary>
+    <p>A timer on the Tower checks its services once a minute and publishes the result with a UTC timestamp. The timer only runs while the Tower is running Linux and can reach the internet.</p>
+    <p><strong>OPERATIONAL</strong>: a recent heartbeat, every component up. <strong>DEGRADED</strong>: a recent heartbeat, at least one component down; the list shows which.</p>
+    <p><strong>OFFLINE / WINDOWS MODE</strong>: no heartbeat for more than five minutes. The Tower is powered off, booted into Windows, or cut off from the internet. This page cannot tell those apart; in all three the app, the Sparks and the dev tunnel are unreachable.</p>
+    <p><strong>STATUS UNKNOWN</strong>: this page could not get a trustworthy copy of the heartbeat. It says nothing about the Tower.</p>
+    <p>"Dev tunnel endpoint" is checked from the Tower's side only. It does not prove that the tunnel is reachable from where you are.</p>
+  </details>
+
+  <noscript><p>This page needs JavaScript to read the heartbeat.</p></noscript>
+</main>
+
+<script>
+'use strict';
+
+var LABELS = {
+  'app': 'Fulcrum app',
+  'proxy': 'Inference proxy',
+  'spark-1': 'Spark 1',
+  'spark-2': 'Spark 2',
+  'tunnel': 'Dev tunnel endpoint (Tower side)'
+};
+var STATE_TEXT = { operational: 'OPERATIONAL', degraded: 'DEGRADED', offline: 'OFFLINE / WINDOWS MODE', unknown: 'STATUS UNKNOWN' };
+
+var BEATS = 5, MIN_THRESHOLD_S = 300, MAX_THRESHOLD_S = 3600;  // OFFLINE after 5 missed beats, 300 s at least
+var CDN_LAG_S = 300;          // raw.githubusercontent.com answers with cache-control: max-age=300
+var CONFIRM_S = 180;          // an API answer this recent confirms that no newer heartbeat exists
+var FUTURE_TOLERANCE_S = 120; // a heartbeat further ahead of this device's clock is not believed
+var TICK_MS = 60000;
+
+// Where the heartbeat lives: the `status` branch of the repository this page is served from
+// (https://<owner>.github.io/<repo>/). Anywhere else (a local preview), status.json next to the page.
+var gh = /^([a-z0-9][a-z0-9-]*)\.github\.io$/i.exec(location.hostname);
+var repo = location.pathname.split('/').filter(Boolean)[0] || location.hostname;
+var SOURCES = gh
+  ? { api: 'https://api.github.com/repos/' + gh[1] + '/' + repo + '/contents/status.json?ref=status',
+      cdn: 'https://raw.githubusercontent.com/' + gh[1] + '/' + repo + '/status/status.json' }
+  : { local: 'status.json' };
+
+var st = {
+  best: null,                 // newest believable heartbeat seen so far
+  freshOkAtMs: null,          // last time the API (or the local file) answered with a believable document
+  future: {},                 // per source: its last document carried a timestamp from the future
+  apiTriedAtMs: -Infinity,
+  apiBlockedUntilMs: 0,       // GitHub's rate limit for this viewer address has been reached
+  apiReserveUntilMs: 0,       // three requests left: kept for "Check now"
+  errors: {},                 // per source, text of the last failure
+  polledAtMs: null
+};
+
+// Reduces whatever was fetched to { tsMs, ts, interval, components:[{id, up}], future } or null.
+function validate(doc, nowMs) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.schema !== 1) return null;
+  if (typeof doc.ts !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(doc.ts)) return null;
+  var tsMs = Date.parse(doc.ts);
+  if (!isFinite(tsMs)) return null;
+  var interval = (Number.isInteger(doc.interval_s) && doc.interval_s >= 10 && doc.interval_s <= 3600) ? doc.interval_s : 60;
+  var c = doc.components;
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return null;
+  var ids = Object.keys(c), components = [];
+  if (!ids.length || ids.length > 12) return null;
+  for (var i = 0; i < ids.length; i++) {
+    if (!/^[a-z0-9-]{1,24}$/.test(ids[i])) return null;
+    if (c[ids[i]] !== 'up' && c[ids[i]] !== 'down') return null;
+    components.push({ id: ids[i], up: c[ids[i]] === 'up' });
+  }
+  return { tsMs: tsMs, ts: doc.ts, interval: interval, components: components, future: tsMs > nowMs + FUTURE_TOLERANCE_S * 1000 };
+}
+
+function thresholdFor(hb) { return Math.min(MAX_THRESHOLD_S, Math.max(MIN_THRESHOLD_S, BEATS * hb.interval)); }
+
+// Pure: the state for a moment in time, from what has been read so far.
+function decide(nowMs, s) {
+  var sawFuture = Object.keys(s.future).some(function (k) { return s.future[k]; });
+  if (!s.best) return { state: 'unknown', reason: sawFuture ? 'clock' : 'unreadable' };
+  var ageS = Math.max(0, (nowMs - s.best.tsMs) / 1000), thresholdS = thresholdFor(s.best);
+  if (ageS <= thresholdS) {
+    var down = s.best.components.filter(function (c) { return !c.up; });
+    return { state: down.length ? 'degraded' : 'operational', ageS: ageS, thresholdS: thresholdS, down: down };
+  }
+  // Something is publishing, with a clock this device does not agree with: not evidence of an outage.
+  if (sawFuture) return { state: 'unknown', reason: 'clock', ageS: ageS, thresholdS: thresholdS };
+  var confirmed = (s.freshOkAtMs !== null && nowMs - s.freshOkAtMs <= CONFIRM_S * 1000) || ageS > thresholdS + CDN_LAG_S;
+  return { state: confirmed ? 'offline' : 'unknown', reason: confirmed ? null : 'unconfirmed', ageS: ageS, thresholdS: thresholdS };
+}
+
+// One fetched document from one source. A newer heartbeat is never un-seen; a heartbeat from the future is
+// never believed and never counts as confirmation.
+function take(doc, source) {
+  var hb = validate(doc, Date.now());
+  if (!hb) throw new Error('not a status document');
+  st.future[source] = hb.future;
+  if (hb.future) return;
+  if (source !== 'cdn') st.freshOkAtMs = Date.now();
+  if (!st.best || hb.tsMs > st.best.tsMs || (hb.tsMs === st.best.tsMs && source !== 'cdn')) { hb.source = source; st.best = hb; }
+}
+
+function request(url, headers) {
+  return fetch(url, { cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', headers: headers || {} });
+}
+
+function readCdn() {
+  return request(SOURCES.cdn).then(function (r) {
+    if (r.status === 404) throw new Error('no status file published yet');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (doc) {
+    take(doc, 'cdn');
+    delete st.errors.cdn;
+  }).catch(function (e) { st.errors.cdn = e.message || 'failed'; });
+}
+
+function readApi() {
+  st.apiTriedAtMs = Date.now();
+  return request(SOURCES.api, { 'Accept': 'application/vnd.github.raw+json' }).then(function (r) {
+    var left = r.headers.get('x-ratelimit-remaining'), reset = Number(r.headers.get('x-ratelimit-reset'));
+    var until = reset > 0 ? reset * 1000 : Date.now() + 600000;   // GitHub's reset time, or ten minutes
+    var limited = r.status === 429 || (r.status === 403 && Number(left) === 0);
+    if (limited) st.apiBlockedUntilMs = until;
+    else if (left !== null && Number(left) <= 3) st.apiReserveUntilMs = until;   // keep the rest for "Check now"
+    if (limited) throw new Error('rate limit reached for this network');
+    if (r.status === 404) throw new Error('no status file published yet');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (doc) {
+    if (doc && typeof doc.content === 'string' && doc.encoding === 'base64') doc = JSON.parse(atob(doc.content.replace(/\s/g, '')));
+    take(doc, 'api');
+    delete st.errors.api;
+  }).catch(function (e) { st.errors.api = e.message || 'failed'; });
+}
+
+function readLocal() {
+  return request(SOURCES.local).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (doc) {
+    take(doc, 'local');
+    delete st.errors.local;
+  }).catch(function (e) { st.errors.local = e.message || 'failed'; });
+}
+
+// How often the API is asked. It is the fresher reader but GitHub allows 60 unauthenticated requests an
+// hour per address, so: every other tick while the heartbeat is on time, every tick while it looks late,
+// every fifth once it is long gone (the CDN, asked every tick, will show the first new heartbeat).
+function apiSpacingMs(nowMs) {
+  if (!st.best) return 55000;
+  var ageS = (nowMs - st.best.tsMs) / 1000;
+  return ageS > 900 ? 290000 : ageS > 150 ? 55000 : 110000;
+}
+
+var polling = false;
+function poll(manual) {
+  if (polling) return Promise.resolve();
+  polling = true;
+  var now = Date.now(), jobs = [];
+  var apiHeld = now < st.apiBlockedUntilMs || (!manual && now < st.apiReserveUntilMs);
+  if (SOURCES.cdn) jobs.push(readCdn());
+  if (SOURCES.api && !apiHeld && now - st.apiTriedAtMs >= (manual ? 10000 : apiSpacingMs(now))) jobs.push(readApi());
+  if (SOURCES.local) jobs.push(readLocal());
+  return Promise.all(jobs).then(function () { polling = false; st.polledAtMs = Date.now(); render(); });
+}
+
+function fmtAge(s) {
+  s = Math.floor(s);
+  if (s < 60) return s + ' s';
+  if (s < 3600) return Math.floor(s / 60) + ' min ' + (s % 60) + ' s';
+  if (s < 86400) return Math.floor(s / 3600) + ' h ' + Math.floor((s % 3600) / 60) + ' min';
+  return Math.floor(s / 86400) + ' d ' + Math.floor((s % 86400) / 3600) + ' h';
+}
+function fmtUtc(ts) { return ts.replace('T', ' ').replace('Z', ' UTC'); }
+function fmtLocal(tsMs) {
+  try { return new Date(tsMs).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }); }
+  catch (e) { return new Date(tsMs).toString(); }
+}
+function label(id) { return Object.prototype.hasOwnProperty.call(LABELS, id) ? LABELS[id] : id; }
+function $(id) { return document.getElementById(id); }
+function setText(el, text) { if (el.textContent !== text) el.textContent = text; }   // no re-announcement of unchanged text
+
+function summaryFor(d, now) {
+  var hb = st.best;
+  if (d.state === 'operational') return 'The Tower is up and every component answered.';
+  if (d.state === 'degraded') {
+    return 'The Tower is up. ' + d.down.length + ' of ' + hb.components.length + ' components ' + (d.down.length === 1 ? 'is' : 'are') + ' down: ' +
+      d.down.map(function (c) { return label(c.id); }).join(', ') + '.';
+  }
+  if (d.state === 'offline') {
+    return 'No heartbeat for ' + fmtAge(d.ageS) + '. The Tower is powered off, booted into Windows, or has no internet connection. Last seen ' + fmtUtc(hb.ts) + '.';
+  }
+  if (d.reason === 'clock') return 'The status file carries a timestamp from the future. The Tower clock or the clock of this device is wrong, so the age of the heartbeat cannot be judged.';
+  if (d.reason === 'unconfirmed') {
+    var heldUntil = Math.max(st.apiBlockedUntilMs, st.apiReserveUntilMs);
+    var until = heldUntil > now ? ' until ' + new Date(heldUntil).toLocaleTimeString() : '';
+    return 'The newest copy this page could get is ' + fmtAge(d.ageS) + ' old, but it came from a GitHub cache that can be five minutes behind, and the GitHub API is not answering for your network' + until + '. The Tower was up at ' + fmtUtc(hb.ts) + '.';
+  }
+  var errs = Object.keys(st.errors).map(function (k) { return k + ': ' + st.errors[k]; }).join('; ');
+  return 'This page could not read the status file from GitHub' + (errs ? ' (' + errs + ')' : '') + '. That says nothing about the Tower: check your connection and try again.';
+}
+
+function render() {
+  var now = Date.now(), d = decide(now, st), hb = st.best;
+  var banner = $('banner');
+  if (banner.className !== 'state-' + d.state) banner.className = 'state-' + d.state;
+  var checking = st.polledAtMs === null;
+  setText($('state'), checking ? 'CHECKING' : STATE_TEXT[d.state]);
+  setText($('summary'), checking ? 'Reading the last heartbeat.' : summaryFor(d, now));
+  document.title = (checking ? 'Checking' : STATE_TEXT[d.state]) + ' · Tower status';
+
+  setText($('hb-time-label'), d.state === 'offline' ? 'Last seen' : 'Last heartbeat');
+  setText($('hb-time'), hb ? fmtUtc(hb.ts) + '  (' + fmtLocal(hb.tsMs) + ')' : '—');
+  setText($('hb-age'), hb ? fmtAge(Math.max(0, (now - hb.tsMs) / 1000)) + ' ago' : '—');
+  setText($('hb-source'), !hb ? '—' : hb.source === 'api' ? 'GitHub API (at most a minute behind)' : hb.source === 'cdn' ? 'GitHub CDN copy (can be five minutes behind)' : 'local file');
+  setText($('checked'), st.polledAtMs === null ? '' : 'Checked ' + fmtAge((now - st.polledAtMs) / 1000) + ' ago.');
+
+  // Component states are shown only while they are current; a stale list would show green beside OFFLINE.
+  var live = d.state === 'operational' || d.state === 'degraded';
+  $('components-box').hidden = !live;
+  var key = live ? hb.ts + '|' + hb.components.map(function (c) { return c.id + (c.up ? '+' : '-'); }).join(',') : '';
+  var list = $('components');
+  if (list.getAttribute('data-key') !== key) {
+    list.setAttribute('data-key', key);
+    while (list.firstChild) list.removeChild(list.firstChild);
+    if (live) hb.components.forEach(function (c) {
+      var li = document.createElement('li'), name = document.createElement('span'), pill = document.createElement('span');
+      name.textContent = label(c.id);
+      pill.textContent = c.up ? 'UP' : 'DOWN';
+      pill.className = 'pill ' + (c.up ? 'up' : 'down');
+      li.appendChild(name); li.appendChild(pill); list.appendChild(li);
+    });
+  }
+}
+
+$('refresh').addEventListener('click', function () { poll(true); });
+document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(false); });
+setInterval(render, 1000);                         // the age keeps counting between polls; OFFLINE needs no fetch
+setInterval(function () { poll(false); }, TICK_MS);
+poll(false);
+</script>
+</body>
+</html>
