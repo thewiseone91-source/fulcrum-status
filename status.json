@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "ts": "2026-10-17T16:55:00Z",
+  "interval_s": 60,
+  "components": {
+    "app": "up",
+    "proxy": "up",
+    "spark-1": "up",
+    "spark-2": "up",
+    "tunnel": "up"
+  }
+}
